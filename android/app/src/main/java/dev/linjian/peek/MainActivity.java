@@ -64,6 +64,7 @@ import java.util.Date;
 import java.util.List;
 
 public class MainActivity extends Activity {
+    private boolean privacyResumed;
     private static final String PREF_A11Y_SETTINGS_OPENED_AT = "a11y_settings_opened_at";
     private static final long A11Y_CONFIRM_WINDOW_MS = 30000L;
     private static final String DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/linzhi-524/linjian-peek-public/main/update.json";
@@ -133,6 +134,10 @@ public class MainActivity extends Activity {
         AppPrefs.respectSystemStop(this);
         setContentView(R.layout.activity_main);
         bindViews();
+        if (tokenInput != null) {
+            SensitiveData.protect(tokenInput);
+            tokenInput.getViewTreeObserver().addOnGlobalLayoutListener(this::updateConnectionPrivacy);
+        }
         buildMagazinePages();
         loadSettings();
         NowState.start(this);
@@ -1939,8 +1944,11 @@ public class MainActivity extends Activity {
     }
 
     private void showTab(String tab) {
+        if ("settings".equals(tab) && drawerConnection != null && drawerConnection.getVisibility() == View.VISIBLE)
+            getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE);
         currentTab = tab;
         setVisible(sectionLife, "life".equals(tab)); setVisible(sectionSee, "see".equals(tab)); setVisible(sectionGate, "gate".equals(tab)); setVisible(sectionSettings, "settings".equals(tab));
+        updateConnectionPrivacy();
         setVisible(sectionControl, false); setVisible(sectionDebug, false);
         setTabSelected(tabLife, "life".equals(tab)); setTabSelected(tabSee, "see".equals(tab)); setTabSelected(tabGate, "gate".equals(tab)); setTabSelected(tabSettings, "settings".equals(tab));
         updateHeader(tab);
@@ -2016,12 +2024,19 @@ public class MainActivity extends Activity {
             bottomNav.requestApplyInsets();
         }
     }
+    private void updateConnectionPrivacy() {
+        boolean protect = tokenInput != null && tokenInput.isShown();
+        SensitiveData.updateWindow(this, protect, privacyResumed);
+    }
+
     private void bindDrawer(Button b, View drawer, String title) {
         if (b == null || drawer == null) return;
         b.setText(title + "  ›");
         b.setOnClickListener(v -> {
             boolean show = drawer.getVisibility() != View.VISIBLE;
+            if (drawer == drawerConnection && show) getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE);
             drawer.setVisibility(show ? View.VISIBLE : View.GONE);
+            updateConnectionPrivacy();
             b.setText(title + (show ? "  ˄" : "  ›"));
             applyVisualTheme();
         });
@@ -2272,8 +2287,8 @@ public class MainActivity extends Activity {
 
     private int dp(float v) { return (int) (v * getResources().getDisplayMetrics().density + 0.5f); }
 
-    @Override protected void onResume() { super.onResume(); if (AppPrefs.serviceRequested(this)) CompanionService.recover(this, "activity_visible", true); serviceRunning = CompanionService.isRunning(); updateUI(); if (recentlyOpenedAccessibilitySettings()) scheduleAccessibilityFollowupChecks(); uiHandler.removeCallbacks(refreshTick); uiHandler.post(refreshTick); }
-    @Override protected void onPause() { saveConnectionSettingsOnly(true); uiHandler.removeCallbacks(refreshTick); super.onPause(); }
+    @Override protected void onResume() { super.onResume(); privacyResumed = true; updateConnectionPrivacy(); if (AppPrefs.serviceRequested(this)) CompanionService.recover(this, "activity_visible", true); serviceRunning = CompanionService.isRunning(); updateUI(); if (recentlyOpenedAccessibilitySettings()) scheduleAccessibilityFollowupChecks(); uiHandler.removeCallbacks(refreshTick); uiHandler.post(refreshTick); }
+    @Override protected void onPause() { privacyResumed = false; SensitiveData.connectionVisible = false; saveConnectionSettingsOnly(true); uiHandler.removeCallbacks(refreshTick); super.onPause(); }
     @Override protected void onStop() { saveConnectionSettingsOnly(true); super.onStop(); }
 
     @Override public void onBackPressed() {
@@ -2545,6 +2560,7 @@ public class MainActivity extends Activity {
     }
 
     private void testScreenshot() {
+        if (SensitiveData.connectionVisible) { Toast.makeText(this,"请先收起连接设置，再测试截图",Toast.LENGTH_LONG).show(); return; }
         saveSettings(); String url = serverUrl == null ? "" : serverUrl.getText().toString().trim(); String token = tokenInput == null ? "" : tokenInput.getText().toString().trim(); ScreenshotService ss = ScreenshotService.getInstance();
         if (url.isEmpty() || token.isEmpty()) { Toast.makeText(this, "先填服务器地址和 Token", Toast.LENGTH_SHORT).show(); return; }
         if (ss == null) { DebugState.append(this, "测试失败：无障碍服务未连接"); Toast.makeText(this, "先开启无障碍服务", Toast.LENGTH_LONG).show(); openAccessibilitySettings(); return; }

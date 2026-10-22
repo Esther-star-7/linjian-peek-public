@@ -158,7 +158,7 @@ public class ScreenshotService extends AccessibilityService {
                 return body;
             } else {
                 if (code == 429) DebugState.append(this, "无障碍兜底轮询限流：HTTP 429，稍后自动重试");
-                else DebugState.append(this, "无障碍后台轮询失败：HTTP " + code + " " + clip(body));
+                else DebugState.append(this, "无障碍后台轮询失败：HTTP " + code);
             }
             return "";
         } finally { conn.disconnect(); }
@@ -180,9 +180,11 @@ public class ScreenshotService extends AccessibilityService {
 
     private int collect(AccessibilityNodeInfo node, StringBuilder sb, JSONArray nodes, int depth, int count) {
         if (node == null || count > 140 || depth > 14) return count;
+        if (SensitiveData.protectedNode(node)) return count;
         CharSequence text = node.getText();
         CharSequence desc = node.getContentDescription();
         String value = text != null && text.length() > 0 ? text.toString() : (desc != null && desc.length() > 0 ? desc.toString() : "");
+        value = SensitiveData.redact(this, value);
         if (value.length() > 0) {
             if (sb.length() < 2600) sb.append(value).append(" | ");
             try {
@@ -214,7 +216,7 @@ public class ScreenshotService extends AccessibilityService {
             AccessibilityNodeInfo root = getRootInActiveWindow();
             TextHit hit = new TextHit(); hit.targetIndex = Math.max(1, index); hit.match = (match == null || match.length() == 0) ? "contains" : match; hit.query = query.trim();
             findTextNode(root, hit);
-            if (hit.node == null) { out.put("ok", false); out.put("result", "text_not_found:" + query); out.put("nodes", getScreenNodesJsonNow()); if (root != null) root.recycle(); return out; }
+            if (hit.node == null) { out.put("ok", false); out.put("result", SensitiveData.redact(this, "text_not_found:" + query)); out.put("nodes", getScreenNodesJsonNow()); if (root != null) root.recycle(); return out; }
             Rect r = new Rect(); hit.node.getBoundsInScreen(r);
             AccessibilityNodeInfo clickable = findClickableSelfOrParent(hit.node);
             boolean clicked = false;
@@ -245,10 +247,11 @@ public class ScreenshotService extends AccessibilityService {
     }
 
     private String nodeText(AccessibilityNodeInfo node) {
+        if (SensitiveData.protectedNode(node)) return "";
         CharSequence text = node.getText();
         CharSequence desc = node.getContentDescription();
-        if (text != null && text.length() > 0) return text.toString();
-        if (desc != null && desc.length() > 0) return desc.toString();
+        if (text != null && text.length() > 0) return SensitiveData.redact(this, text.toString());
+        if (desc != null && desc.length() > 0) return SensitiveData.redact(this, desc.toString());
         return "";
     }
 
@@ -335,11 +338,13 @@ public class ScreenshotService extends AccessibilityService {
     }
 
     public void doScreenshot(String serverUrl, String token) {
+        if (SensitiveData.connectionVisible) { DebugState.append(this, "截图已阻止：连接设置包含敏感信息"); return; }
         if (Build.VERSION.SDK_INT < 30) { DebugState.append(this, "截图失败：Android 版本低于 11"); return; }
         final String finalUrl = normalizeUrl(serverUrl);
         DebugState.append(this, "开始调用系统截图 API");
         takeScreenshot(Display.DEFAULT_DISPLAY, executor, new TakeScreenshotCallback() {
             @Override public void onSuccess(ScreenshotResult result) {
+                if (SensitiveData.connectionVisible) { result.getHardwareBuffer().close(); return; }
                 try {
                     DebugState.append(ScreenshotService.this, "系统截图成功，开始编码");
                     Bitmap hardwareBitmap = Bitmap.wrapHardwareBuffer(result.getHardwareBuffer(), result.getColorSpace());
@@ -368,8 +373,8 @@ public class ScreenshotService extends AccessibilityService {
             conn.setConnectTimeout(15000); conn.setReadTimeout(30000);
             OutputStream os = conn.getOutputStream(); os.write(data); os.flush(); os.close();
             int code = conn.getResponseCode(); String body = readBody(conn, code);
-            if (code >= 200 && code < 300) DebugState.append(this, "上传成功：HTTP " + code + " " + clip(body));
-            else DebugState.append(this, "上传失败：HTTP " + code + " " + clip(body));
+            if (code >= 200 && code < 300) DebugState.append(this, "上传成功：HTTP " + code);
+            else DebugState.append(this, "上传失败：HTTP " + code);
             conn.disconnect();
         } catch (Exception e) { DebugState.append(this, "上传异常：" + shortMsg(e)); }
     }
@@ -377,5 +382,5 @@ public class ScreenshotService extends AccessibilityService {
     public static String normalizeUrl(String url) { if (url == null) return ""; url = url.trim(); while (url.endsWith("/")) url = url.substring(0, url.length() - 1); return url; }
     static String readBody(HttpURLConnection conn, int code) { try { InputStream is = code >= 400 ? conn.getErrorStream() : conn.getInputStream(); if (is == null) return ""; ByteArrayOutputStream bos = new ByteArrayOutputStream(); byte[] buf = new byte[1024]; int n; while ((n = is.read(buf)) > 0) bos.write(buf, 0, n); return new String(bos.toByteArray(), "UTF-8"); } catch (Exception e) { return ""; } }
     static String clip(String s) { if (s == null) return ""; s = s.replace('\n', ' ').replace('\r', ' '); return s.length() > 90 ? s.substring(0, 90) + "…" : s; }
-    static String shortMsg(Exception e) { String msg = e.getClass().getSimpleName(); if (e.getMessage() != null) msg += ": " + e.getMessage(); return clip(msg); }
+    static String shortMsg(Exception e) { return e.getClass().getSimpleName(); }
 }

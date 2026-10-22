@@ -178,7 +178,7 @@ public class CompanionService extends Service {
                     long retryMs = parseRetryAfterMs(conn.getHeaderField("Retry-After"));
                     rateLimitedUntilMs = System.currentTimeMillis() + retryMs;
                     DebugState.append(this, "轮询限流：HTTP 429，约 " + Math.max(1, retryMs / 1000) + " 秒后重试");
-                } else DebugState.append(this, "轮询失败：HTTP " + code + " " + ScreenshotService.clip(body));
+                } else DebugState.append(this, "轮询失败：HTTP " + code);
             }
             return "";
         } finally { conn.disconnect(); }
@@ -394,7 +394,8 @@ public class CompanionService extends Service {
                 if (svc != null) { JSONObject rr = svc.inputText(inputText, append); ok = rr.optBoolean("ok", false); result = rr.toString(); }
                 else result = "accessibility service not ready";
             } else if ("peek".equals(action)) {
-                if (svc != null) { svc.doScreenshot(serverUrl, token); ok = true; result = "screenshot requested"; }
+                if (SensitiveData.connectionVisible) result = "screenshot_blocked_sensitive_settings";
+                else if (svc != null) { svc.doScreenshot(serverUrl, token); ok = true; result = "screenshot requested"; }
                 else result = "accessibility service not ready";
             } else if ("open_app".equals(action)) {
                 if (pkg == null || pkg.length() == 0) pkg = AppPrefs.packageForApp(ctx, app);
