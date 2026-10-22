@@ -54,10 +54,34 @@ public class AppPrefs {
     }
     public static boolean saveServiceRequested(Context ctx, boolean requested) {
         SharedPreferences.Editor editor = get(ctx).edit();
-        if (requested) editor.putLong("service_user_start_at", System.currentTimeMillis());
+        if (requested) {
+            editor.putLong("service_user_start_at", System.currentTimeMillis());
+            writeRuntimeScope(ctx, editor);
+        }
         return editor.putBoolean(KEY_SERVICE_REQUESTED, requested)
                 .putBoolean(KEY_USER_STOPPED, !requested).putBoolean(KEY_RECOVERY_PENDING, false)
                 .putLong(KEY_SERVICE_GENERATION, get(ctx).getLong(KEY_SERVICE_GENERATION, 0) + 1).commit();
+    }
+    private static int bootCount(Context ctx) {
+        try { return android.provider.Settings.Global.getInt(ctx.getContentResolver(), "boot_count", -1); }
+        catch (RuntimeException e) { return -1; }
+    }
+    private static long packageUpdatedAt(Context ctx) {
+        try { return ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0).lastUpdateTime; }
+        catch (android.content.pm.PackageManager.NameNotFoundException e) { return -1; }
+    }
+    private static void writeRuntimeScope(Context ctx, SharedPreferences.Editor editor) {
+        editor.putInt("service_boot_count", bootCount(ctx))
+                .putLong("service_package_updated_at", packageUpdatedAt(ctx));
+    }
+    public static void recordRuntimeScope(Context ctx) {
+        SharedPreferences.Editor editor = get(ctx).edit();
+        writeRuntimeScope(ctx, editor); editor.commit();
+    }
+    public static boolean backgroundRecoveryAllowed(Context ctx) {
+        if (get(ctx).getBoolean(KEY_WAKE_RESTORE, false)) return true;
+        return get(ctx).getInt("service_boot_count", Integer.MIN_VALUE) == bootCount(ctx)
+                && get(ctx).getLong("service_package_updated_at", Long.MIN_VALUE) == packageUpdatedAt(ctx);
     }
     public static final String KEY_SERVER = "server_url";
     public static final String KEY_TOKEN = "token";

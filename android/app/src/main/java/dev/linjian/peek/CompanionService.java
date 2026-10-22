@@ -50,12 +50,16 @@ public class CompanionService extends Service {
     public static boolean recover(Context ctx, String reason, boolean visible) {
         AppPrefs.respectSystemStop(ctx);
         if (!AppPrefs.serviceRequested(ctx) || isRunning()) return false;
+        if (!visible && !AppPrefs.backgroundRecoveryAllowed(ctx)) {
+            AppPrefs.get(ctx).edit().putBoolean(AppPrefs.KEY_RECOVERY_PENDING, true).commit();
+            return false;
+        }
         if (!visible && AppPrefs.get(ctx).getBoolean(AppPrefs.KEY_RECOVERY_PENDING, false)) return false;
         long now = System.currentTimeMillis();
         if (!visible && now - AppPrefs.get(ctx).getLong("service_last_recovery", 0) < 60_000) return false;
         AppPrefs.get(ctx).edit().putLong("service_last_recovery", now).commit();
         try {
-            Intent start = new Intent(ctx, CompanionService.class).setAction("RECOVER");
+            Intent start = new Intent(ctx, CompanionService.class).setAction("RECOVER").putExtra("user_visible_start", visible);
             if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(start); else ctx.startService(start);
             DebugState.append(ctx, "已请求恢复常驻服务：" + reason);
             return true;
@@ -93,6 +97,12 @@ public class CompanionService extends Service {
             manualStop(this); stopSelf(); return START_NOT_STICKY;
         }
         if (!AppPrefs.serviceRequested(this)) { stopSelf(); return START_NOT_STICKY; }
+        if ((intent == null || !intent.getBooleanExtra("user_visible_start", false))
+                && (!AppPrefs.backgroundRecoveryAllowed(this)
+                    || AppPrefs.get(this).getBoolean(AppPrefs.KEY_RECOVERY_PENDING, false))) {
+            AppPrefs.get(this).edit().putBoolean(AppPrefs.KEY_RECOVERY_PENDING, true).commit();
+            stopSelf(); return START_NOT_STICKY;
+        }
         try {
             createNotificationChannel();
             Notification notification = buildNotification("常驻运行 · 自主唤醒仅本地模拟");
@@ -113,6 +123,7 @@ public class CompanionService extends Service {
             AppPrefs.get(this).edit().putBoolean(AppPrefs.KEY_RECOVERY_PENDING, true).commit();
             stopSelf(); return START_NOT_STICKY;
         }
+        AppPrefs.recordRuntimeScope(this);
         AppPrefs.get(this).edit().putBoolean(AppPrefs.KEY_RECOVERY_PENDING, false).apply();
         NowState.start(this);
         activeService = this;

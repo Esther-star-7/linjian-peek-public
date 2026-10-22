@@ -31,6 +31,7 @@ public class WakeLifecycleTest {
         // Each test represents a fresh app process, including its once-per-process exit check.
         org.robolectric.util.ReflectionHelpers.setStaticField(AppPrefs.class, "exitChecked", false);
         context = RuntimeEnvironment.getApplication();
+        android.provider.Settings.Global.putInt(context.getContentResolver(), "boot_count", 100);
         AppPrefs.get(context).edit().clear().commit();
         context.deleteDatabase("autonomous_wake_v1.db");
         AppPrefs.get(context)
@@ -298,5 +299,47 @@ public class WakeLifecycleTest {
             assertEquals("delivered", c.getString(0));
             assertEquals("pending", c.getString(1));
         }
+    }
+
+    @Test
+    public void watchdogCanRecoverWithinSameBootWithoutBootOptIn() {
+        AppPrefs.saveServiceRequested(context, true);
+        assertTrue(CompanionService.recover(context, "watchdog", false));
+        assertNotNull(Shadows.shadowOf((Application) context).getNextStartedService());
+    }
+
+    @Test
+    public void watchdogCannotBypassDisabledBootRecoveryBeforeBootBroadcast() {
+        AppPrefs.saveServiceRequested(context, true);
+        android.provider.Settings.Global.putInt(context.getContentResolver(), "boot_count", 101);
+        assertFalse(CompanionService.recover(context, "watchdog", false));
+        assertTrue(AppPrefs.serviceRequested(context));
+        assertNull(Shadows.shadowOf((Application) context).getNextStartedService());
+    }
+
+    @Test
+    public void updateRecoveryGateAlsoAppliesToWatchdog() {
+        AppPrefs.saveServiceRequested(context, true);
+        AppPrefs.get(context).edit().putLong("service_package_updated_at", -123).commit();
+        assertFalse(CompanionService.recover(context, "watchdog", false));
+        assertTrue(CompanionService.recover(context, "activity_visible", true));
+    }
+
+    @Test
+    public void enabledRecoveryAllowsNewBoot() {
+        AppPrefs.saveServiceRequested(context, true);
+        AppPrefs.get(context).edit().putBoolean(AppPrefs.KEY_WAKE_RESTORE, true).commit();
+        android.provider.Settings.Global.putInt(context.getContentResolver(), "boot_count", 101);
+        new WakeReceiver().onReceive(context, new Intent(Intent.ACTION_BOOT_COMPLETED));
+        assertNotNull(Shadows.shadowOf((Application) context).getNextStartedService());
+    }
+
+    @Test
+    public void stickyRestartAlsoRespectsDisabledBootRecovery() {
+        AppPrefs.saveServiceRequested(context, true);
+        android.provider.Settings.Global.putInt(context.getContentResolver(), "boot_count", 101);
+        controller = Robolectric.buildService(CompanionService.class).create();
+        assertEquals(Service.START_NOT_STICKY, controller.get().onStartCommand(null, 0, 1));
+        assertFalse(CompanionService.isRunning());
     }
 }
