@@ -99,6 +99,9 @@ public class WakeLifecycleTest {
     @Test
     public void simulationCreatesLocalNotificationAndKeepsOutbox() {
         CompanionService service = start();
+        // A late boot broadcast must not revoke a fresh, explicit user start.
+        new WakeReceiver().onReceive(context, new Intent(Intent.ACTION_BOOT_COMPLETED));
+        assertFalse(AppPrefs.get(context).getBoolean(AppPrefs.KEY_RECOVERY_PENDING, false));
         WakeRuntime.simulate(service);
         WakeRuntime.dispatch(service);
         try (WakeQueue q = new WakeQueue(context)) {
