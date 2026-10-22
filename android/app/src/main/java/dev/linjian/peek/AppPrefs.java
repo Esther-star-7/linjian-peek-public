@@ -13,6 +13,76 @@ public class AppPrefs {
     public static final String PREFS = "linjian_peek";
     public static final String APP_VERSION_NAME = "0.3.9.0";
     public static final int APP_VERSION_CODE = 30900;
+    public static final String KEY_SERVICE_REQUESTED = "service_requested";
+    public static final String KEY_SERVICE_GENERATION = "service_generation";
+    public static final String KEY_USER_STOPPED = "user_stopped";
+    public static final String KEY_WAKE_ENABLED = "wake_enabled";
+    public static final String KEY_WAKE_RESTORE = "wake_restore";
+    public static final String KEY_WAKE_QUIET = "wake_quiet";
+    public static final String KEY_WAKE_DEBUG = "wake_debug";
+    public static final String KEY_WAKE_USAGE = "wake_usage";
+    public static final String KEY_RECOVERY_PENDING = "service_recovery_pending";
+
+    public static boolean serviceRequested(Context ctx) {
+        SharedPreferences p = get(ctx);
+        // Migrate only an explicit legacy start; a fresh install must never auto-start.
+        boolean requested = p.getBoolean(KEY_SERVICE_REQUESTED,
+                p.contains(KEY_USER_STOPPED) && !p.getBoolean(KEY_USER_STOPPED, true));
+        return WakePolicy.mayRun(requested, p.getBoolean(KEY_USER_STOPPED, true));
+    }
+    public static boolean wakeEnabled(Context ctx) { return get(ctx).getBoolean(KEY_WAKE_ENABLED, false); }
+    public static boolean wakeActive(Context ctx) { return wakeEnabled(ctx) && serviceRequested(ctx); }
+    private static boolean exitChecked;
+    /** Android's task-manager Stop kills the process without delivering onDestroy. */
+    public static synchronized void respectSystemStop(Context ctx) {
+        if (exitChecked) return;
+        exitChecked = true;
+        if (android.os.Build.VERSION.SDK_INT < 30) return;
+        try {
+            android.app.ActivityManager am = (android.app.ActivityManager) ctx.getSystemService(Context.ACTIVITY_SERVICE);
+            if (am == null) return;
+            java.util.List<android.app.ApplicationExitInfo> exits = am.getHistoricalProcessExitReasons(ctx.getPackageName(), 0, 1);
+            if (!exits.isEmpty()) {
+                android.app.ApplicationExitInfo exit = exits.get(0);
+                if (exit.getReason() == android.app.ApplicationExitInfo.REASON_USER_REQUESTED
+                        && exit.getTimestamp() > get(ctx).getLong("service_user_start_at", 0)) {
+                    saveServiceRequested(ctx, false);
+                    DebugState.append(ctx, "检测到系统中的用户停止操作，请手动启动常驻服务");
+                }
+            }
+        } catch (RuntimeException ignored) { /* Missing OEM history never overrides explicit preferences. */ }
+    }
+    public static boolean saveServiceRequested(Context ctx, boolean requested) {
+        SharedPreferences.Editor editor = get(ctx).edit();
+        if (requested) {
+            editor.putLong("service_user_start_at", System.currentTimeMillis());
+            writeRuntimeScope(ctx, editor);
+        }
+        return editor.putBoolean(KEY_SERVICE_REQUESTED, requested)
+                .putBoolean(KEY_USER_STOPPED, !requested).putBoolean(KEY_RECOVERY_PENDING, false)
+                .putLong(KEY_SERVICE_GENERATION, get(ctx).getLong(KEY_SERVICE_GENERATION, 0) + 1).commit();
+    }
+    private static int bootCount(Context ctx) {
+        try { return android.provider.Settings.Global.getInt(ctx.getContentResolver(), "boot_count", -1); }
+        catch (RuntimeException e) { return -1; }
+    }
+    private static long packageUpdatedAt(Context ctx) {
+        try { return ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0).lastUpdateTime; }
+        catch (android.content.pm.PackageManager.NameNotFoundException e) { return -1; }
+    }
+    private static void writeRuntimeScope(Context ctx, SharedPreferences.Editor editor) {
+        editor.putInt("service_boot_count", bootCount(ctx))
+                .putLong("service_package_updated_at", packageUpdatedAt(ctx));
+    }
+    public static void recordRuntimeScope(Context ctx) {
+        SharedPreferences.Editor editor = get(ctx).edit();
+        writeRuntimeScope(ctx, editor); editor.commit();
+    }
+    public static boolean backgroundRecoveryAllowed(Context ctx) {
+        if (get(ctx).getBoolean(KEY_WAKE_RESTORE, false)) return true;
+        return get(ctx).getInt("service_boot_count", Integer.MIN_VALUE) == bootCount(ctx)
+                && get(ctx).getLong("service_package_updated_at", Long.MIN_VALUE) == packageUpdatedAt(ctx);
+    }
     public static final String KEY_SERVER = "server_url";
     public static final String KEY_TOKEN = "token";
     public static final String KEY_DEVICE = "device_id";

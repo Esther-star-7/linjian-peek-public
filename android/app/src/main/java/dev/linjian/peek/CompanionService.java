@@ -37,6 +37,50 @@ public class CompanionService extends Service {
     private static final int HOME_MODE_NOTIFICATION_ID = 20260913;
     private static volatile boolean running = false;
 
+    private static volatile CompanionService activeService;
+    private WakeRuntime wakeRuntime;
+    private volatile boolean stopping;
+    private final Handler wakeHandler = new Handler(android.os.Looper.getMainLooper());
+    private final Runnable wakeDispatch = () -> WakeRuntime.dispatch(this);
+
+    public static void requestWakeDispatch() {
+        CompanionService service = activeService;
+        if (service != null) { service.wakeHandler.removeCallbacks(service.wakeDispatch); service.wakeHandler.post(service.wakeDispatch); }
+    }
+    public static boolean recover(Context ctx, String reason, boolean visible) {
+        AppPrefs.respectSystemStop(ctx);
+        if (!AppPrefs.serviceRequested(ctx) || isRunning()) return false;
+        if (!visible && !AppPrefs.backgroundRecoveryAllowed(ctx)) {
+            AppPrefs.get(ctx).edit().putBoolean(AppPrefs.KEY_RECOVERY_PENDING, true).commit();
+            return false;
+        }
+        if (!visible && AppPrefs.get(ctx).getBoolean(AppPrefs.KEY_RECOVERY_PENDING, false)) return false;
+        long now = System.currentTimeMillis();
+        if (!visible && now - AppPrefs.get(ctx).getLong("service_last_recovery", 0) < 60_000) return false;
+        AppPrefs.get(ctx).edit().putLong("service_last_recovery", now).commit();
+        try {
+            Intent start = new Intent(ctx, CompanionService.class).setAction("RECOVER").putExtra("user_visible_start", visible);
+            if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(start); else ctx.startService(start);
+            DebugState.append(ctx, "已请求恢复常驻服务：" + reason);
+            return true;
+        } catch (RuntimeException e) {
+            AppPrefs.get(ctx).edit().putBoolean(AppPrefs.KEY_RECOVERY_PENDING, true).commit();
+            DebugState.append(ctx, "系统暂不允许恢复服务，请打开应用后启动：" + e.getClass().getSimpleName());
+            return false;
+        }
+    }
+    public static void manualStop(Context ctx) {
+        // commit before stopping: boot, sticky restart and accessibility share this gate.
+        if (!AppPrefs.saveServiceRequested(ctx, false)) {
+            throw new IllegalStateException("Cannot persist stopped state");
+        }
+        CompanionService service = activeService;
+        if (service != null) service.stopping = true;
+        running = false;
+        WakeRuntime.cancel(ctx);
+        ctx.stopService(new Intent(ctx, CompanionService.class));
+    }
+
     private String serverUrl;
     private String token;
     private Handler pollHandler;
@@ -48,24 +92,45 @@ public class CompanionService extends Service {
     @Override public IBinder onBind(Intent intent) { return null; }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
-        if (intent != null && "STOP".equals(intent.getAction())) { stopSelf(); return START_NOT_STICKY; }
-        createNotificationChannel();
-        NowState.start(this);
-        startForeground(NOTIFICATION_ID, buildNotification("已启动，等待掌心窗命令"));
-        if (intent != null) {
-            serverUrl = ScreenshotService.normalizeUrl(intent.getStringExtra("server_url"));
-            token = intent.getStringExtra("token");
+        AppPrefs.respectSystemStop(this);
+        if (intent != null && "STOP".equals(intent.getAction())) {
+            manualStop(this); stopSelf(); return START_NOT_STICKY;
         }
-        if (serverUrl == null || token == null) {
-            serverUrl = ScreenshotService.normalizeUrl(AppPrefs.server(this));
-            token = AppPrefs.token(this);
-        }
-        if (serverUrl == null || token == null || serverUrl.isEmpty() || token.isEmpty()) {
-            DebugState.append(this, "服务启动失败：服务器地址或 Token 为空");
+        if (!AppPrefs.serviceRequested(this)) { stopSelf(); return START_NOT_STICKY; }
+        if ((intent == null || !intent.getBooleanExtra("user_visible_start", false))
+                && (!AppPrefs.backgroundRecoveryAllowed(this)
+                    || AppPrefs.get(this).getBoolean(AppPrefs.KEY_RECOVERY_PENDING, false))) {
+            AppPrefs.get(this).edit().putBoolean(AppPrefs.KEY_RECOVERY_PENDING, true).commit();
             stopSelf(); return START_NOT_STICKY;
         }
-        DebugState.append(this, "掌心窗公开版 v0.3.9.0 服务已启动，目标：" + serverUrl);
-        if (!running) { running = true; startPolling(); } else DebugState.append(this, "服务已在运行，继续轮询");
+        try {
+            createNotificationChannel();
+            Notification notification = buildNotification("常驻运行 · 自主唤醒仅本地模拟");
+            if (Build.VERSION.SDK_INT >= 34) {
+                startForeground(NOTIFICATION_ID, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+            } else if (Build.VERSION.SDK_INT >= 29) {
+                startForeground(NOTIFICATION_ID, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+            } else startForeground(NOTIFICATION_ID, notification);
+        } catch (RuntimeException e) {
+            AppPrefs.get(this).edit().putBoolean(AppPrefs.KEY_RECOVERY_PENDING, true).commit();
+            DebugState.append(this, "前台服务启动受限：" + e.getClass().getSimpleName());
+            stopSelf(); return START_NOT_STICKY;
+        }
+        serverUrl = ScreenshotService.normalizeUrl(AppPrefs.server(this));
+        token = AppPrefs.token(this);
+        if ((serverUrl.isEmpty() || token.isEmpty()) && !AppPrefs.wakeEnabled(this)) {
+            DebugState.append(this, "服务启动失败：请配置连接或开启自主唤醒");
+            AppPrefs.get(this).edit().putBoolean(AppPrefs.KEY_RECOVERY_PENDING, true).commit();
+            stopSelf(); return START_NOT_STICKY;
+        }
+        AppPrefs.recordRuntimeScope(this);
+        AppPrefs.get(this).edit().putBoolean(AppPrefs.KEY_RECOVERY_PENDING, false).apply();
+        NowState.start(this);
+        activeService = this;
+        running = true;
+        if (pollThread == null && !serverUrl.isEmpty() && !token.isEmpty()) startPolling();
+        if (wakeRuntime == null) { wakeRuntime = new WakeRuntime(this); wakeRuntime.start(); }
+        requestWakeDispatch();
         return START_STICKY;
     }
 
@@ -78,19 +143,26 @@ public class CompanionService extends Service {
     }
 
     private void pollLoop() {
-        if (!running) return;
+        if (stopping || !running || !AppPrefs.serviceRequested(this)) return;
+        requestWakeDispatch();
         long now = System.currentTimeMillis();
+        long generation = AppPrefs.get(this).getLong(AppPrefs.KEY_SERVICE_GENERATION, 0);
         long delay = AppPrefs.interval(this);
         try {
+            if (serverUrl.isEmpty() || token.isEmpty()) {
+                if (!stopping && running) pollHandler.postDelayed(this::pollLoop, 15000);
+                return;
+            }
             uploadStateThrottled(serverUrl, token, this, false);
+            if (stopping || !AppPrefs.serviceRequested(this) || generation != AppPrefs.get(this).getLong(AppPrefs.KEY_SERVICE_GENERATION, 0)) return;
             if (rateLimitedUntilMs > now) {
                 delay = Math.max(delay, rateLimitedUntilMs - now);
             } else {
                 String body = pollServer();
-                if (body != null && body.length() > 0) handleCommandBody(this, body, serverUrl, token);
+                if (!stopping && running && generation == AppPrefs.get(this).getLong(AppPrefs.KEY_SERVICE_GENERATION, 0) && AppPrefs.serviceRequested(this) && body != null && body.length() > 0) handleCommandBody(this, body, serverUrl, token);
             }
         } catch (Exception e) { DebugState.append(this, "轮询异常：" + ScreenshotService.shortMsg(e)); }
-        if (running) pollHandler.postDelayed(this::pollLoop, Math.max(AppPrefs.MIN_POLL_INTERVAL_MS, delay));
+        if (!stopping && running) pollHandler.postDelayed(this::pollLoop, Math.max(AppPrefs.MIN_POLL_INTERVAL_MS, delay));
     }
 
     private String pollServer() throws Exception {
@@ -106,7 +178,7 @@ public class CompanionService extends Service {
                     long retryMs = parseRetryAfterMs(conn.getHeaderField("Retry-After"));
                     rateLimitedUntilMs = System.currentTimeMillis() + retryMs;
                     DebugState.append(this, "轮询限流：HTTP 429，约 " + Math.max(1, retryMs / 1000) + " 秒后重试");
-                } else DebugState.append(this, "轮询失败：HTTP " + code + " " + ScreenshotService.clip(body));
+                } else DebugState.append(this, "轮询失败：HTTP " + code);
             }
             return "";
         } finally { conn.disconnect(); }
@@ -322,7 +394,8 @@ public class CompanionService extends Service {
                 if (svc != null) { JSONObject rr = svc.inputText(inputText, append); ok = rr.optBoolean("ok", false); result = rr.toString(); }
                 else result = "accessibility service not ready";
             } else if ("peek".equals(action)) {
-                if (svc != null) { svc.doScreenshot(serverUrl, token); ok = true; result = "screenshot requested"; }
+                if (SensitiveData.connectionVisible) result = "screenshot_blocked_sensitive_settings";
+                else if (svc != null) { svc.doScreenshot(serverUrl, token); ok = true; result = "screenshot requested"; }
                 else result = "accessibility service not ready";
             } else if ("open_app".equals(action)) {
                 if (pkg == null || pkg.length() == 0) pkg = AppPrefs.packageForApp(ctx, app);
@@ -558,7 +631,7 @@ public class CompanionService extends Service {
     }
 
     private static String postJson(String urlStr, String token, JSONObject obj) throws Exception {
-        HttpURLConnection conn = (HttpURLConnection)new URL(urlStr).openConnection(); conn.setRequestMethod("POST"); conn.setRequestProperty("Content-Type", "application/json; charset=utf-8"); conn.setRequestProperty("X-Auth-Token", token); conn.setDoOutput(true);
+        HttpURLConnection conn = (HttpURLConnection)new URL(urlStr).openConnection(); conn.setConnectTimeout(10000); conn.setReadTimeout(15000); conn.setRequestMethod("POST"); conn.setRequestProperty("Content-Type", "application/json; charset=utf-8"); conn.setRequestProperty("X-Auth-Token", token); conn.setDoOutput(true);
         byte[] data = obj.toString().getBytes(StandardCharsets.UTF_8); try (OutputStream os = conn.getOutputStream()) { os.write(data); }
         InputStream is = conn.getResponseCode() >= 400 ? conn.getErrorStream() : conn.getInputStream();
         ByteArrayOutputStream bos = new ByteArrayOutputStream(); if (is != null) { byte[] buf = new byte[1024]; int n; while ((n = is.read(buf)) > 0) bos.write(buf,0,n); }
@@ -566,6 +639,29 @@ public class CompanionService extends Service {
     }
 
     private void createNotificationChannel() { if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) { NotificationManager nm = getSystemService(NotificationManager.class); NotificationChannel channel = new NotificationChannel(CHANNEL_ID, "掌心窗", NotificationManager.IMPORTANCE_LOW); channel.setDescription("掌心窗正在等待你授权的截图与手机动作请求"); nm.createNotificationChannel(channel); NotificationChannel reminder = new NotificationChannel(REMINDER_CHANNEL_ID, "掌心窗悬浮横幅提醒", NotificationManager.IMPORTANCE_HIGH); reminder.setDescription("来自掌心窗的悬浮横幅、生活提醒与回家模式"); reminder.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC); reminder.enableVibration(true); nm.createNotificationChannel(reminder); } }
-    private Notification buildNotification(String text) { Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ? new Notification.Builder(this, CHANNEL_ID) : new Notification.Builder(this); return builder.setContentTitle("掌心窗运行中").setContentText(text).setSmallIcon(android.R.drawable.ic_menu_view).setOngoing(true).build(); }
-    @Override public void onDestroy() { running = false; DebugState.append(this, "服务已销毁/停止"); if (pollThread != null) pollThread.quitSafely(); super.onDestroy(); }
+    private Notification buildNotification(String text) {
+        PendingIntent stop = PendingIntent.getService(this, 31002, new Intent(this, CompanionService.class).setAction("STOP"), PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        PendingIntent open = PendingIntent.getActivity(this, 31003, new Intent(this, MainActivity.class), PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        Notification.Builder builder = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(this, CHANNEL_ID) : new Notification.Builder(this);
+        return builder.setContentTitle("掌心窗运行中").setContentText(text).setSmallIcon(android.R.drawable.ic_menu_view)
+                .setContentIntent(open).addAction(android.R.drawable.ic_media_pause, "停止", stop).setOngoing(true).build();
+    }
+    // Android 15+ timeout callbacks: do not immediately restart a service stopped by the OS.
+    public void onTimeout(int startId, int foregroundServiceType) { systemTimeout(); }
+    public void onTimeout(int startId) { systemTimeout(); }
+    private void systemTimeout() {
+        AppPrefs.get(this).edit().putBoolean(AppPrefs.KEY_RECOVERY_PENDING, true).commit();
+        DebugState.append(this, "系统限制常驻运行，请回到应用恢复");
+        stopping = true; running = false; stopSelf();
+    }
+    @Override public void onDestroy() {
+        stopping = true; running = false; activeService = null;
+        wakeHandler.removeCallbacksAndMessages(null);
+        if (wakeRuntime != null) { wakeRuntime.stop(); wakeRuntime = null; }
+        if (pollHandler != null) pollHandler.removeCallbacksAndMessages(null);
+        if (pollThread != null) pollThread.quitSafely();
+        stopForeground(true);
+        if (!AppPrefs.serviceRequested(this)) WakeRuntime.cancel(this);
+        DebugState.append(this, "服务已销毁/停止"); super.onDestroy();
+    }
 }

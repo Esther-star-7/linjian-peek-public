@@ -32,6 +32,9 @@ jobs:
       - name: Build APK
         run: bash android/build.sh
 
+      - name: Test autonomous wake queue and service lifecycle
+        run: mvn -B -C -f android/tests/pom.xml test
+
       - name: Verify APK exists
         run: |
           ls -lh android/*.apk
