@@ -49,16 +49,8 @@ public class ScreenshotService extends AccessibilityService {
     private final Runnable watchdogTick = new Runnable() {
         @Override public void run() {
             try {
-                SharedPreferences prefs = getSharedPreferences(AppPrefs.PREFS, MODE_PRIVATE);
-                String url = prefs.getString(AppPrefs.KEY_SERVER, "");
-                String tk = prefs.getString(AppPrefs.KEY_TOKEN, "");
-                boolean userStopped = prefs.getBoolean("user_stopped", false);
-                if (!CompanionService.isRunning() && !userStopped && !url.isEmpty() && !tk.isEmpty()) {
-                    DebugState.append(ScreenshotService.this, "看门狗：尝试重启前台服务");
-                    Intent i = new Intent(ScreenshotService.this, CompanionService.class);
-                    i.putExtra("server_url", url);
-                    i.putExtra("token", tk);
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(i); else startService(i);
+                if (AppPrefs.serviceRequested(ScreenshotService.this)) {
+                    CompanionService.recover(ScreenshotService.this, "accessibility_watchdog", false);
                 }
             } catch (Exception e) {
                 DebugState.append(ScreenshotService.this, "看门狗异常：" + shortMsg(e));
@@ -73,10 +65,11 @@ public class ScreenshotService extends AccessibilityService {
                 SharedPreferences prefs = getSharedPreferences(AppPrefs.PREFS, MODE_PRIVATE);
                 String url = normalizeUrl(prefs.getString(AppPrefs.KEY_SERVER, ""));
                 String tk = prefs.getString(AppPrefs.KEY_TOKEN, "");
-                boolean userStopped = prefs.getBoolean("user_stopped", true);
+                boolean userStopped = !AppPrefs.serviceRequested(ScreenshotService.this);
                 if (!userStopped && !url.isEmpty() && !tk.isEmpty() && !CompanionService.isRunning()) {
+                    long generation = AppPrefs.get(ScreenshotService.this).getLong(AppPrefs.KEY_SERVICE_GENERATION, 0);
                     String body = pollServerFromAccessibility(url, tk);
-                    if (body != null && body.length() > 0) CompanionService.handleCommandBody(ScreenshotService.this, body, url, tk);
+                    if (generation == AppPrefs.get(ScreenshotService.this).getLong(AppPrefs.KEY_SERVICE_GENERATION, 0) && AppPrefs.serviceRequested(ScreenshotService.this) && body != null && body.length() > 0) CompanionService.handleCommandBody(ScreenshotService.this, body, url, tk);
                 }
             } catch (Exception e) {
                 DebugState.append(ScreenshotService.this, "无障碍后台轮询异常：" + shortMsg(e));
@@ -90,6 +83,7 @@ public class ScreenshotService extends AccessibilityService {
 
     @Override public void onServiceConnected() {
         super.onServiceConnected();
+        AppPrefs.respectSystemStop(this);
         instance = this;
         NowState.start(this);
         DebugState.append(this, "无障碍服务已连接：截图/读屏/节点坐标/活动轨迹/远程息屏/专注模式可用 v0.3.9.0");
@@ -105,6 +99,7 @@ public class ScreenshotService extends AccessibilityService {
         int t = event.getEventType();
         if (t == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED || t == AccessibilityEvent.TYPE_WINDOWS_CHANGED || t == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED || t == AccessibilityEvent.TYPE_VIEW_SCROLLED) updateScreenText();
         if (t == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && pkg != null) {
+            WakeRuntime.usage(this, pkg.toString());
             ActivityEventStore.recordForegroundChange(this, pkg.toString());
             FocusMode.onForegroundPackage(this, pkg.toString());
         }

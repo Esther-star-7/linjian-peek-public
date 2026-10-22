@@ -130,6 +130,7 @@ public class MainActivity extends Activity {
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        AppPrefs.respectSystemStop(this);
         setContentView(R.layout.activity_main);
         bindViews();
         buildMagazinePages();
@@ -255,6 +256,9 @@ public class MainActivity extends Activity {
                 if ("dynamic_privacy".equals(tag) || "dynamic_diary_backup".equals(tag)) settings.removeViewAt(i);
             }
             settings.setPadding(0, 0, 0, dp(42));
+            Button wakeButton = actionButton("自主唤醒  ›", false);
+            wakeButton.setOnClickListener(v -> showWakeSettings());
+            settings.addView(wakeButton, marginBottom(8));
             Button privacyButton = actionButton("隐私与记录  ›", false);
             privacyButton.setTag("dynamic_privacy");
             LinearLayout privacy = cardColumn();
@@ -2268,7 +2272,7 @@ public class MainActivity extends Activity {
 
     private int dp(float v) { return (int) (v * getResources().getDisplayMetrics().density + 0.5f); }
 
-    @Override protected void onResume() { super.onResume(); serviceRunning = CompanionService.isRunning(); updateUI(); if (recentlyOpenedAccessibilitySettings()) scheduleAccessibilityFollowupChecks(); uiHandler.removeCallbacks(refreshTick); uiHandler.post(refreshTick); }
+    @Override protected void onResume() { super.onResume(); if (AppPrefs.serviceRequested(this)) CompanionService.recover(this, "activity_visible", true); serviceRunning = CompanionService.isRunning(); updateUI(); if (recentlyOpenedAccessibilitySettings()) scheduleAccessibilityFollowupChecks(); uiHandler.removeCallbacks(refreshTick); uiHandler.post(refreshTick); }
     @Override protected void onPause() { saveConnectionSettingsOnly(true); uiHandler.removeCallbacks(refreshTick); super.onPause(); }
     @Override protected void onStop() { saveConnectionSettingsOnly(true); super.onStop(); }
 
@@ -2477,18 +2481,68 @@ public class MainActivity extends Activity {
         else if (requestCode == REQ_DIARY_IMPORT && resultCode == RESULT_OK && data != null && data.getData() != null) importDiaryFrom(data.getData());
     }
 
-    private void startCompanionService() {
-        saveSettings();
-        String url = serverUrl == null ? "" : serverUrl.getText().toString().trim(); String token = tokenInput == null ? "" : tokenInput.getText().toString().trim();
-        if (url.isEmpty() || token.isEmpty()) { Toast.makeText(this, "请填写服务器地址和 Token", Toast.LENGTH_SHORT).show(); return; }
-        if (ScreenshotService.getInstance() == null) { DebugState.append(this, "启动失败：无障碍服务未连接"); Toast.makeText(this, "请先开启掌心窗无障碍服务", Toast.LENGTH_LONG).show(); openAccessibilitySettings(); return; }
-        getSharedPreferences(AppPrefs.PREFS, MODE_PRIVATE).edit().putBoolean("user_stopped", false).apply(); requestIgnoreBatteryOptimization();
-        Intent intent = new Intent(this, CompanionService.class); intent.putExtra("server_url", url); intent.putExtra("token", token);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent); else startService(intent);
-        DebugState.append(this, "已请求启动前台服务：公开版 v0.3.9.0 右侧 love 线稿花枝已启用"); serviceRunning = true; updateUI();
+    private void showWakeSettings() {
+        LinearLayout panel = new LinearLayout(this); panel.setOrientation(LinearLayout.VERTICAL); panel.setPadding(dp(20), dp(8), dp(20), dp(8));
+        TextView description = new TextView(this);
+        description.setText("V1 仅在本机模拟唤醒和发送通知，不连接 AI。开启总开关后还需点击启动；关闭开关不会停止现有远程服务。定时约 15 分钟，省电/Doze 下可能延迟。应用使用事件仅监听已授权无障碍中的目标 App。\n开机/更新恢复由系统决定；强行停止后需手动打开应用。免打扰时事件保留到允许时段。本页事件记录保留在本机，不上传。");
+        panel.addView(description);
+        String[] keys = {AppPrefs.KEY_WAKE_ENABLED, AppPrefs.KEY_WAKE_QUIET, AppPrefs.KEY_WAKE_RESTORE, AppPrefs.KEY_WAKE_USAGE, AppPrefs.KEY_WAKE_DEBUG};
+        String[] labels = {"自主唤醒总开关", "免打扰（23:00–08:00）", "允许开机 / 更新后恢复已启动服务", "目标 App 使用事件（需无障碍授权）", "自主唤醒调试日志（不记录屏幕内容）"};
+        boolean[] defaults = {false, true, false, false, false};
+        for (int n=0; n<keys.length; n++) {
+            final String key=keys[n];
+            CheckBox check=new CheckBox(this); check.setText(labels[n]); check.setChecked(AppPrefs.get(this).getBoolean(key, defaults[n]));
+            check.setOnCheckedChangeListener((button, enabled) -> {
+                if (AppPrefs.KEY_WAKE_USAGE.equals(key) && enabled && !isAccessibilityServiceEnabled()) {
+                    check.setChecked(false); Toast.makeText(this,"请先在权限设置中授权无障碍；不会额外读取使用记录",Toast.LENGTH_LONG).show(); return;
+                }
+                if (!AppPrefs.get(this).edit().putBoolean(key,enabled).commit()) {
+                    Toast.makeText(this,"设置保存失败，请重试",Toast.LENGTH_LONG).show(); return;
+                }
+                if (AppPrefs.wakeActive(this)) { WakeRuntime.schedule(this); CompanionService.requestWakeDispatch(); }
+                else WakeRuntime.cancel(this);
+            });
+            panel.addView(check);
+        }
+        TextView status=new TextView(this); panel.addView(status);
+        Runnable refresh=() -> {
+            try (WakeQueue q=new WakeQueue(this)) {
+                status.setText("服务："+(CompanionService.isRunning()?"运行中":"已停止 / 待恢复")
+                        +" · 本地待处理："+q.pending()+" · 待同步留存："+q.unsynced()
+                        +"\n"+AppPrefs.get(this).getString("wake_status", "同步适配器尚未接入；队列上限 10000，满时明确拒绝新事件"));
+            } catch (RuntimeException e) { status.setText("队列读取失败："+e.getClass().getSimpleName()); }
+        };
+        Button start=actionButton("手动启动",true); start.setOnClickListener(v->{startCompanionService(); refresh.run();}); panel.addView(start);
+        Button stop=actionButton("手动停止（含远程监听）",false); stop.setOnClickListener(v->{stopCompanionService(); refresh.run();}); panel.addView(stop);
+        Button simulate=actionButton("模拟唤醒 / 本地通知",false); simulate.setOnClickListener(v->{
+            if (!AppPrefs.wakeActive(this) || !CompanionService.isRunning()) { Toast.makeText(this,"请开启总开关并手动启动服务",Toast.LENGTH_LONG).show(); return; }
+            long id=WakeRuntime.simulate(this); Toast.makeText(this,id>0 ? "已入队；免打扰或通知被关闭时保留待处理" : "入队失败，请查看队列状态",Toast.LENGTH_LONG).show(); refresh.run();
+        }); panel.addView(simulate);
+        Button refreshButton=actionButton("刷新队列状态",false); refreshButton.setOnClickListener(v->refresh.run()); panel.addView(refreshButton);
+        Button logs=actionButton("查看调试日志",false); logs.setOnClickListener(v->new AlertDialog.Builder(this).setTitle("本机调试日志").setMessage(DebugState.get(this)).setPositiveButton("关闭",null).show()); panel.addView(logs);
+        refresh.run(); ScrollView scroll=new ScrollView(this); scroll.addView(panel);
+        new AlertDialog.Builder(this).setTitle("自主唤醒 · V1").setView(scroll).setPositiveButton("关闭",null).show();
     }
 
-    private void stopCompanionService() { getSharedPreferences(AppPrefs.PREFS, MODE_PRIVATE).edit().putBoolean("user_stopped", true).apply(); stopService(new Intent(this, CompanionService.class)); DebugState.append(this, "已停止服务"); serviceRunning = false; updateUI(); }
+    private void startCompanionService() {
+        if (CompanionService.isRunning()) { Toast.makeText(this,"服务已在运行",Toast.LENGTH_SHORT).show(); return; }
+        saveSettings();
+        String url=AppPrefs.server(this), token=AppPrefs.token(this);
+        if (!AppPrefs.wakeEnabled(this)) {
+            if (url.isEmpty() || token.isEmpty()) { Toast.makeText(this,"请配置服务器和 Token，或开启自主唤醒本地模式",Toast.LENGTH_LONG).show(); return; }
+            if (ScreenshotService.getInstance()==null) { Toast.makeText(this,"远程操作需先开启掌心窗无障碍服务",Toast.LENGTH_LONG).show(); openAccessibilitySettings(); return; }
+        }
+        if (!AppPrefs.saveServiceRequested(this,true)) { Toast.makeText(this,"启动状态保存失败",Toast.LENGTH_LONG).show(); return; }
+        boolean requested=CompanionService.recover(this,"manual_start",true);
+        if (!requested && !CompanionService.isRunning()) Toast.makeText(this,"启动受限，请查看调试日志",Toast.LENGTH_LONG).show();
+        serviceRunning=CompanionService.isRunning(); updateUI();
+    }
+
+    private void stopCompanionService() {
+        try { CompanionService.manualStop(this); DebugState.append(this,"已手动停止，不会自动恢复"); }
+        catch (RuntimeException e) { Toast.makeText(this,"停止状态保存失败，请重试",Toast.LENGTH_LONG).show(); }
+        serviceRunning=CompanionService.isRunning(); updateUI();
+    }
 
     private void testScreenshot() {
         saveSettings(); String url = serverUrl == null ? "" : serverUrl.getText().toString().trim(); String token = tokenInput == null ? "" : tokenInput.getText().toString().trim(); ScreenshotService ss = ScreenshotService.getInstance();
